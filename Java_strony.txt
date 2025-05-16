@@ -1,0 +1,5 @@
+https://stackoverflow.com/
+https://javarevisited.blogspot.com/
+https://www.w3schools.com/java/
+https://www.geeksforgeeks.org/java/
+https://docs.oracle.com/javase/8/docs/api/
