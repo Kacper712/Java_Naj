@@ -1,0 +1,304 @@
+// Dot.java
+package com.example.circleapp;
+
+import javafx.scene.paint.Color;
+
+// Rekord reprezentujący punkt (okrąg) na płótnie
+public record Dot(double x, double y, Color color, double radius) {
+    // Konwertuje dane do postaci tekstowej do przesłania sieciowo
+    public static String toMessage(double x, double y, Color color, double radius) {
+        return x + ";" + y + ";" + color.toString() + ";" + radius;
+    }
+
+    public static String toMessage(Dot dot) {
+        return toMessage(dot.x, dot.y, dot.color, dot.radius);
+    }
+
+    // Tworzy obiekt Dot z tekstu
+    public static Dot fromMessage(String msg) {
+        String[] parts = msg.split(";");
+        return new Dot(
+            Double.parseDouble(parts[0]),
+            Double.parseDouble(parts[1]),
+            Color.web(parts[2]),
+            Double.parseDouble(parts[3])
+        );
+    }
+
+    // Zwraca kolor w formacie tekstowym (dla bazy danych)
+    public String toDbColor() {
+        return color.toString();
+    }
+}
+
+
+// Controller.java
+package com.example.circleapp;
+
+import client.ServerThread;
+import javafx.fxml.FXML;
+import javafx.scene.canvas.Canvas;
+import javafx.scene.canvas.GraphicsContext;
+import javafx.scene.control.ColorPicker;
+import javafx.scene.control.Slider;
+import javafx.scene.input.MouseEvent;
+import javafx.scene.paint.Color;
+import server.Server;
+
+// Kontroler FXML – obsługuje logikę interfejsu graficznego
+public class Controller {
+    @FXML
+    private Canvas canvas;
+    @FXML
+    private ColorPicker colorPicker;
+    @FXML
+    private Slider radiusSlider;
+
+    private final Server server;
+    private final ServerThread serverThread;
+
+    public Controller(Server server, ServerThread serverThread) {
+        this.server = server;
+        this.serverThread = serverThread;
+        // Ustawia konsumenta Dota (odpowiedzialnego za rysowanie)
+        this.serverThread.setDotConsumer(this::drawDot);
+    }
+
+    // Rysuje okrąg na podstawie danych Dot
+    private void drawDot(Dot dot) {
+        GraphicsContext gc = canvas.getGraphicsContext2D();
+        gc.setFill(dot.color());
+        gc.fillOval(dot.x() - dot.radius(), dot.y() - dot.radius(), dot.radius() * 2, dot.radius() * 2);
+    }
+
+    // Obsługa kliknięcia na kanwie – wysyła dane do serwera
+    @FXML
+    private void onMouseClicked(MouseEvent event) {
+        double x = event.getX();
+        double y = event.getY();
+        double radius = radiusSlider.getValue();
+        Color color = colorPicker.getValue();
+
+        serverThread.send(x, y, color, radius);
+    }
+}
+
+
+// server/Server.java
+package server;
+
+import com.example.circleapp.Dot;
+
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+
+// Serwer obsługujący klientów i bazę danych
+public class Server {
+    private ServerSocket serverSocket;
+    private final List<ClientThread> clients = new ArrayList<>();
+    private Connection dbConnection;
+
+    public Server(int port) throws IOException, SQLException {
+        serverSocket = new ServerSocket(port);
+        connectDatabase();
+        // Wątek nasłuchujący klientów
+        new Thread(() -> {
+            while (true) {
+                try {
+                    Socket clientSocket = serverSocket.accept();
+                    ClientThread ct = new ClientThread(clientSocket, this);
+                    clients.add(ct);
+                    ct.start();
+                    // Przesyłanie starych punktów nowemu klientowi
+                    for (Dot dot : getSavedDots()) {
+                        ct.send(Dot.toMessage(dot));
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }).start();
+    }
+
+    // Połączenie z bazą SQLite
+    private void connectDatabase() throws SQLException {
+        dbConnection = DriverManager.getConnection("jdbc:sqlite:dots.db");
+    }
+
+    // Przesyła wiadomość wszystkim klientom i zapisuje ją w bazie
+    public synchronized void broadcast(String message) {
+        saveDot(Dot.fromMessage(message));
+        for (ClientThread client : clients) {
+            client.send(message);
+        }
+    }
+
+    // Zapisuje dane do bazy
+    public void saveDot(Dot dot) {
+        String sql = "INSERT INTO dot(x, y, color, radius) VALUES(?, ?, ?, ?)";
+        try (PreparedStatement stmt = dbConnection.prepareStatement(sql)) {
+            stmt.setDouble(1, dot.x());
+            stmt.setDouble(2, dot.y());
+            stmt.setString(3, dot.toDbColor());
+            stmt.setDouble(4, dot.radius());
+            stmt.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Zwraca wszystkie punkty z bazy
+    public List<Dot> getSavedDots() {
+        List<Dot> dots = new ArrayList<>();
+        try (Statement stmt = dbConnection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT x, y, color, radius FROM dot")) {
+            while (rs.next()) {
+                dots.add(new Dot(
+                    rs.getDouble("x"),
+                    rs.getDouble("y"),
+                    javafx.scene.paint.Color.web(rs.getString("color")),
+                    rs.getDouble("radius")
+                ));
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return dots;
+    }
+}
+
+
+// server/ClientThread.java
+package server;
+
+import java.io.*;
+import java.net.Socket;
+
+// Reprezentuje połączenie z pojedynczym klientem
+public class ClientThread extends Thread {
+    private final Socket socket;
+    private final Server server;
+    private PrintWriter out;
+
+    public ClientThread(Socket socket, Server server) {
+        this.socket = socket;
+        this.server = server;
+    }
+
+    // Wysyła wiadomość do klienta
+    public void send(String message) {
+        if (out != null) {
+            out.println(message);
+        }
+    }
+
+    @Override
+    public void run() {
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+            out = new PrintWriter(socket.getOutputStream(), true);
+            String line;
+            while ((line = in.readLine()) != null) {
+                server.broadcast(line);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+
+// client/ServerThread.java
+package client;
+
+import com.example.circleapp.Dot;
+import javafx.scene.paint.Color;
+
+import java.io.*;
+import java.net.Socket;
+import java.util.function.Consumer;
+
+// Klient nasłuchujący wiadomości z serwera i wysyłający dane
+public class ServerThread {
+    private Socket socket;
+    private PrintWriter out;
+    private Consumer<Dot> dotConsumer;
+
+    public ServerThread(String host, int port) throws IOException {
+        socket = new Socket(host, port);
+        out = new PrintWriter(socket.getOutputStream(), true);
+
+        // Wątek nasłuchujący wiadomości od serwera
+        new Thread(() -> {
+            try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+                String line;
+                while ((line = in.readLine()) != null) {
+                    Dot dot = Dot.fromMessage(line);
+                    if (dotConsumer != null) {
+                        dotConsumer.accept(dot);
+                    }
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    // Ustawia funkcję obsługi przychodzących punktów
+    public void setDotConsumer(Consumer<Dot> consumer) {
+        this.dotConsumer = consumer;
+    }
+
+    // Wysyła dane punktu do serwera
+    public void send(double x, double y, Color color, double radius) {
+        out.println(Dot.toMessage(x, y, color, radius));
+    }
+}
+
+
+// Main.java
+package com.example.circleapp;
+
+import client.ServerThread;
+import javafx.application.Application;
+import javafx.fxml.FXMLLoader;
+import javafx.scene.Scene;
+import javafx.scene.layout.VBox;
+import javafx.stage.Stage;
+import server.Server;
+
+// Klasa uruchamiająca aplikację JavaFX
+public class Main extends Application {
+    @Override
+    public void start(Stage primaryStage) throws Exception {
+        Server server = new Server(5000);
+        ServerThread serverThread = new ServerThread("localhost", 5000);
+
+        FXMLLoader loader = new FXMLLoader(getClass().getResource("/app-view.fxml"));
+        loader.setControllerFactory(c -> new Controller(server, serverThread));
+
+        VBox root = loader.load();
+        Scene scene = new Scene(root);
+        primaryStage.setScene(scene);
+        primaryStage.setTitle("Circle Drawer");
+        primaryStage.show();
+    }
+
+    public static void main(String[] args) {
+        launch(args);
+    }
+}
+
+
+// init_db.sql
+-- SQLite schema for Dot storage
+CREATE TABLE IF NOT EXISTS dot (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    x INTEGER NOT NULL,
+    y INTEGER NOT NULL,
+    color TEXT NOT NULL,
+    radius INTEGER NOT NULL
+);
